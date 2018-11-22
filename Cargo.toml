@@ -1,0 +1,9 @@
+[package]
+name = "multidd"
+version = "0.1.0"
+authors = ["Théo Friberg <theo.friberg@gmail.com>"]
+
+[dependencies]
+
+argparse = "0.2.2"
+pbr = "1.0.0"
