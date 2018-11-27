@@ -5,9 +5,158 @@ use argparse::{ArgumentParser, StoreTrue, Store};
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
-use std::fs;
+use std::io::prelude::*;
+use std::io::SeekFrom;
 use pbr::ProgressBar;
 use pbr::Units;
+use std::io::{Error, ErrorKind};
+
+
+trait Sink{
+  fn write(&mut self, buf : &[u8]) -> std::io::Result<()>;
+  fn force_sync(&mut self) -> std::io::Result<()>;
+}
+
+trait Source{
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+  fn size(&mut self) -> std::io::Result<u64>;
+}
+
+// Struct to read data from a file
+
+struct FileSource {file : File}
+
+impl FileSource {
+  fn new(string : &str) -> Result<FileSource, String>{
+    match File::open(&string) {
+      Ok(x) => Ok(FileSource{file : x}),
+      Err(_) => Err(format!("Failed to open {} for reading", string)),
+    }
+  }
+}
+
+impl Source for FileSource {
+  fn read(&mut self, buf : &mut [u8]) -> std::io::Result<usize>{
+    self.file.read(buf)
+  }
+
+  fn size(&mut self) -> std::io::Result<u64>{
+    let fsize = self.file.seek(SeekFrom::End(0));
+    self.file.seek(SeekFrom::Start(0)).expect("Couldn't seek back to start of input file");
+    fsize.and_then(|x| match x {
+        0 => Err(std::io::Error::new(ErrorKind::Other, "Zero-size file; can't display progress")),
+        x => Ok(x)
+    })
+  }
+}
+
+// Struct to read data from stdin
+
+struct StdInSource{stdin : std::io::Stdin}
+
+impl StdInSource{
+  fn new() -> StdInSource{
+    StdInSource{stdin : std::io::stdin(),}
+  }
+}
+
+impl Source for StdInSource{
+  fn read(&mut self, buf : &mut [u8]) -> std::io::Result<usize>{
+      self.stdin.read(buf)
+  }
+
+  fn size(&mut self) -> std::io::Result<u64>{
+    Err(std::io::Error::new(ErrorKind::Other, "Stream size undefined"))
+  }
+}
+
+
+
+// Struct to pipe data to a set of files
+
+struct FileArraySink { files: Vec<File> }
+
+impl FileArraySink {
+  fn new(strings : &Vec<&str>) -> Result<FileArraySink, String>{
+      let mut file_vector = vec![];
+      for filename in strings{
+          let file = File::create(filename);
+          if file.is_err() {
+            return Err(format!("Failed to open file {} for writing", filename));
+          }
+          file_vector.push(file.unwrap());
+      }
+      Ok(FileArraySink{files : file_vector})
+  }
+}
+
+impl Sink for FileArraySink {
+  fn write(&mut self, buf : &[u8]) -> std::io::Result<()>{
+    let mut result = Ok(());
+    for mut outfile in &mut self.files.iter(){
+      result = result.and_then(|_| outfile.write_all(buf));
+    }
+    result
+  }
+  fn force_sync(&mut self) -> std::io::Result<()>{
+    let mut result = Ok(());
+    for mut outfile in &mut self.files.iter(){
+      result = result.and_then(|_| outfile.sync_all());
+    }
+    result
+  }
+}
+
+// Struct to pipe data out to stdio
+
+struct StdOutSink{stdout : std::io::Stdout}
+
+impl StdOutSink{
+  fn new() -> StdOutSink{
+    StdOutSink{stdout : std::io::stdout(),}
+  }
+}
+
+impl Sink for StdOutSink{
+  fn write(&mut self, buf : &[u8]) -> std::io::Result<()>{
+      self.stdout.write_all(buf)
+  }
+  fn force_sync(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+trait ProgressMonitor {
+    fn setProgress(&mut self, progress : u64) -> ();
+}
+
+struct DummyProgressMonitor { }
+
+impl DummyProgressMonitor {
+  fn new() -> DummyProgressMonitor{
+    DummyProgressMonitor{}
+  }
+}
+
+impl ProgressMonitor for DummyProgressMonitor {
+  fn setProgress(&mut self, progress : u64) -> () { }
+}
+
+struct ProgressBarProgressMonitor { pb : ProgressBar<std::io::Stderr> }
+
+impl ProgressBarProgressMonitor {
+  fn new(fsize : u64) -> ProgressBarProgressMonitor{
+    let mut pb = ProgressBar::on(std::io::stderr(), fsize);
+    pb.set_units(Units::Bytes);
+    pb.format("[=> ]");
+    ProgressBarProgressMonitor {pb : pb}
+  }
+}
+
+impl ProgressMonitor for ProgressBarProgressMonitor{
+  fn setProgress(&mut self, progress : u64) -> () {
+    self.pb.set(progress);
+  }
+}
+
 
 fn main() {
 
@@ -35,78 +184,37 @@ fn main() {
 
   let mut buf = vec![0u8;blocksize];
 
-  // Writing to a file or a set of files
-
-  if output != "" {
-
-    // Open file handles 
-
-    let mut outfiles : Vec<File> = output.split(";")
-               .map(|file_name|
-                 File::create(file_name)
-                   .expect(&format!("Couldn't open output file {}", file_name))).collect();
-
-    // Read from a file
-
-    if input != "" {
-      let mut file = File::open(&input).expect(&format!("Couldn't open input file {}", &input));
-      let fsize = fs::metadata(&input).expect(&format!("Failed to look up size for {}", &input)).len();
-      let mut len = file.read(&mut buf).expect(&format!("Failed initial read on {}", &input));
-      let mut count = len as u64;
-      let mut pb = ProgressBar::new(fsize);
-
-      if !quiet {
-        pb.set_units(Units::Bytes);
-        pb.format("[=> ]");
-      }
-
-      let mut iteration = 0;
-
-      while len > 0 {
-
-        // Update the ui
-
-        if iteration % 100 == 0 && !quiet{
-          pb.set(count);
-        }
-
-        for mut outfile in &mut outfiles{
-          outfile.write_all(&buf[..len]).expect("Write failure");
-        }
-
-        len = file.read(&mut buf).expect(&format!("Read failure on {}", &input));
-        count += len as u64;
-        iteration += 1;
-      }
-
-    }else{ // Case 2: reading from stdin
-
-      let mut stdin = std::io::stdin();
-      let mut len = stdin.read(&mut buf).expect("Failed initial read from stdin");
-
-      while len > 0 {
-        for mut outfile in &mut outfiles {
-          outfile.write_all(&buf[..len]).expect("Write failure");
-        }
-        len = stdin.read(&mut buf).expect("Read failure from stdin");
-      }
-    }
+  let mut output_sink : Box<Sink> = if output != "" {
+      Box::new(FileArraySink::new(&output.split(";").collect()).unwrap())
   } else {
-  let mut stdout = std::io::stdout();
-    if input != "" {
-      let mut file = File::open(&input).expect(&format!("Couldn't open input file {}", &input));
-      let mut len = file.read(&mut buf).expect(&format!("Failed initial read on {}", &input));
-      while len > 0 {
-        stdout.write_all(&buf[..len]).expect("Failed writing to stdout");
-        len = file.read(&mut buf).expect(&format!("Read failure on {}", &input));
-      }
+      Box::new(StdOutSink::new())
+  };
+
+  let mut input_source : Box<Source> = if input != "" {
+      Box::new(FileSource::new(&input).unwrap())
   }else{
-    let mut stdin = std::io::stdin();
-    let mut len = stdin.read(&mut buf).expect("Failed initial read on stdin");
-    while len > 0 {
-      stdout.write_all(&buf[..len]).expect("Failed writing to stdout");
-      len = stdin.read(&mut buf).expect("Failed reading from stdin");
+      Box::new(StdInSource::new())
+  };
+
+  let mut iteration = 0;
+  let mut progressMonitor : Box<ProgressMonitor> = match input_source.size() {
+      Err(_) => Box::new(DummyProgressMonitor::new()),
+      Ok(size) => Box::new(ProgressBarProgressMonitor::new(size)),
+      };
+
+  let mut len = input_source.read(&mut buf).expect("Failed initial read");
+  while len > 0 {
+
+    // Do fs sync
+    
+    if iteration % 500 == 0{
+      output_sink.force_sync().expect("Failed to do OS sync of output stream");
+      if !quiet {
+        progressMonitor.setProgress((iteration * blocksize + len) as u64);
+      }
     }
-   }
+    output_sink.write(&buf[..len]).expect("Write failure");
+    len = input_source.read(&mut buf).expect("Read failure");
+    iteration += 1;
   }
 }
