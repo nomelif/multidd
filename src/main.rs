@@ -9,7 +9,7 @@ use std::io::prelude::*;
 use std::io::SeekFrom;
 use pbr::ProgressBar;
 use pbr::Units;
-use std::io::{Error, ErrorKind};
+use std::io::ErrorKind;
 
 
 trait Sink{
@@ -125,7 +125,7 @@ impl Sink for StdOutSink{
 }
 
 trait ProgressMonitor {
-    fn setProgress(&mut self, progress : u64) -> ();
+    fn set_progress(&mut self, progress : u64) -> ();
 }
 
 struct DummyProgressMonitor { }
@@ -137,7 +137,7 @@ impl DummyProgressMonitor {
 }
 
 impl ProgressMonitor for DummyProgressMonitor {
-  fn setProgress(&mut self, progress : u64) -> () { }
+  fn set_progress(&mut self, _progress : u64) -> () { }
 }
 
 struct ProgressBarProgressMonitor { pb : ProgressBar<std::io::Stderr> }
@@ -152,7 +152,7 @@ impl ProgressBarProgressMonitor {
 }
 
 impl ProgressMonitor for ProgressBarProgressMonitor{
-  fn setProgress(&mut self, progress : u64) -> () {
+  fn set_progress(&mut self, progress : u64) -> () {
     self.pb.set(progress);
   }
 }
@@ -197,7 +197,7 @@ fn main() {
   };
 
   let mut iteration = 0;
-  let mut progressMonitor : Box<ProgressMonitor> = match input_source.size() {
+  let mut progress_monitor : Box<ProgressMonitor> = match input_source.size() {
       Err(_) => Box::new(DummyProgressMonitor::new()),
       Ok(size) => Box::new(ProgressBarProgressMonitor::new(size)),
       };
@@ -210,7 +210,7 @@ fn main() {
     if iteration % 500 == 0{
       output_sink.force_sync().expect("Failed to do OS sync of output stream");
       if !quiet {
-        progressMonitor.setProgress((iteration * blocksize + len) as u64);
+        progress_monitor.set_progress((iteration * blocksize + len) as u64);
       }
     }
     output_sink.write(&buf[..len]).expect("Write failure");
