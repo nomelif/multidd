@@ -10,6 +10,7 @@ use std::io::SeekFrom;
 use pbr::ProgressBar;
 use pbr::Units;
 use std::io::ErrorKind;
+use std::time::{Duration, Instant};
 
 
 trait Sink{
@@ -158,6 +159,27 @@ impl ProgressMonitor for ProgressBarProgressMonitor{
 }
 
 
+struct IndeterminateProgressMonitor { start_time : Instant }
+
+impl IndeterminateProgressMonitor {
+  fn new() -> IndeterminateProgressMonitor{
+    IndeterminateProgressMonitor {start_time : Instant::now()}
+  }
+}
+
+impl ProgressMonitor for IndeterminateProgressMonitor{
+  fn set_progress(&mut self, progress : u64) -> () {
+    let elapsed = self.start_time.elapsed();
+    let elapsed_millis = elapsed.as_secs()*1000 + (elapsed.subsec_millis() as u64);
+    let progress_mib : f32 = (progress as f32 / (1024*1024) as f32) as f32;
+    if elapsed_millis != 0 {
+      eprint!("{} MiB; {} MiB/s\r", progress_mib, progress_mib / (elapsed_millis as f32 / 1000.));
+    }else{
+      eprint!("{} MiB; -- MiB/s\r", progress_mib);
+    }
+  }
+}
+
 fn main() {
 
   let mut quiet = false;
@@ -198,7 +220,7 @@ fn main() {
 
   let mut iteration = 0;
   let mut progress_monitor : Box<ProgressMonitor> = match input_source.size() {
-      Err(_) => Box::new(DummyProgressMonitor::new()),
+      Err(_) => Box::new(IndeterminateProgressMonitor::new()),
       Ok(size) => Box::new(ProgressBarProgressMonitor::new(size)),
       };
 
