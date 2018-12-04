@@ -10,29 +10,43 @@ use std::io::SeekFrom;
 use pbr::ProgressBar;
 use pbr::Units;
 use std::io::ErrorKind;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use std::thread;
 
 
 trait Sink{
-  fn write(&mut self, buf : &[u8]) -> std::io::Result<()>;
-  fn force_sync(&mut self) -> std::io::Result<()>;
+  fn start(&mut self) -> ();
+  fn wait(&mut self) -> ();
 }
 
-trait Source{
+trait Source : Send{
   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
   fn size(&mut self) -> std::io::Result<u64>;
+  fn blocksize(&self) -> u64;
+}
+
+// Source that can be split into many parts for parallell consumption
+
+trait SplittableSource : Source{
+  fn split(&mut self) -> Self;
 }
 
 // Struct to read data from a file
 
-struct FileSource {file : File}
+struct FileSource {file : File, path : String, blocksize : u64}
 
 impl FileSource {
-  fn new(string : &str) -> Result<FileSource, String>{
+  fn new(string : &str, blocksize : u64) -> Result<FileSource, String>{
     match File::open(&string) {
-      Ok(x) => Ok(FileSource{file : x}),
+      Ok(x) => Ok(FileSource{file : x, path : string.to_string(), blocksize : blocksize}),
       Err(_) => Err(format!("Failed to open {} for reading", string)),
     }
+  }
+}
+
+impl SplittableSource for FileSource {
+  fn split(&mut self) -> Self{
+    FileSource::new(&self.path, self.blocksize).unwrap()
   }
 }
 
@@ -40,7 +54,6 @@ impl Source for FileSource {
   fn read(&mut self, buf : &mut [u8]) -> std::io::Result<usize>{
     self.file.read(buf)
   }
-
   fn size(&mut self) -> std::io::Result<u64>{
     let fsize = self.file.seek(SeekFrom::End(0));
     self.file.seek(SeekFrom::Start(0)).expect("Couldn't seek back to start of input file");
@@ -49,15 +62,16 @@ impl Source for FileSource {
         x => Ok(x)
     })
   }
+  fn blocksize(&self) -> u64 { self.blocksize }
 }
 
 // Struct to read data from stdin
 
-struct StdInSource{stdin : std::io::Stdin}
+struct StdInSource{stdin : std::io::Stdin, blocksize : u64}
 
 impl StdInSource{
-  fn new() -> StdInSource{
-    StdInSource{stdin : std::io::stdin(),}
+  fn new(blocksize : u64) -> StdInSource{
+    StdInSource{stdin : std::io::stdin(), blocksize : blocksize}
   }
 }
 
@@ -69,6 +83,7 @@ impl Source for StdInSource{
   fn size(&mut self) -> std::io::Result<u64>{
     Err(std::io::Error::new(ErrorKind::Other, "Stream size undefined"))
   }
+  fn blocksize(&self) -> u64 { self.blocksize }
 }
 
 
@@ -92,54 +107,41 @@ impl FileArraySink {
 }
 
 impl Sink for FileArraySink {
-  fn write(&mut self, buf : &[u8]) -> std::io::Result<()>{
-    let mut result = Ok(());
-    for mut outfile in &mut self.files.iter(){
-      result = result.and_then(|_| outfile.write_all(buf));
-    }
-    result
-  }
-  fn force_sync(&mut self) -> std::io::Result<()>{
-    let mut result = Ok(());
-    for mut outfile in &mut self.files.iter(){
-      result = result.and_then(|_| outfile.sync_all());
-    }
-    result
-  }
+  fn start(&mut self) {}
+  fn wait(&mut self) {}
 }
 
 // Struct to pipe data out to stdio
 
-struct StdOutSink{stdout : std::io::Stdout}
-
+struct StdOutSink{stdout : std::io::Stdout, source : Box<Source>, handle : Option<Box<thread::JoinHandle<Box<FnOnce()>>>>} 
 impl StdOutSink{
-  fn new() -> StdOutSink{
-    StdOutSink{stdout : std::io::stdout(),}
+  fn new(source : Box<Source>) -> StdOutSink{
+    StdOutSink{stdout : std::io::stdout(), source : source, handle : None}
   }
 }
 
 impl Sink for StdOutSink{
-  fn write(&mut self, buf : &[u8]) -> std::io::Result<()>{
-      self.stdout.write_all(buf)
+  fn start(&mut self) {
+    let handle = thread::spawn(|| {
+    let mut buf = vec![0u8;self.source.blocksize() as usize];
+    /*let mut len = self.source.read(&mut buf).expect("Failed initial read");
+    let mut iteration = 0;
+    while len > 0 {
+      self.stdout.write_all(&buf[..len]).expect("Write failure");
+      len = self.source.read(&mut buf).expect("Read failure");
+      iteration += 1;
+    }*/
+    });
   }
-  fn force_sync(&mut self) -> std::io::Result<()> { Ok(()) }
+
+  fn wait(&mut self) {}
 }
 
 trait ProgressMonitor {
     fn set_progress(&mut self, progress : u64) -> ();
 }
 
-struct DummyProgressMonitor { }
 
-impl DummyProgressMonitor {
-  fn new() -> DummyProgressMonitor{
-    DummyProgressMonitor{}
-  }
-}
-
-impl ProgressMonitor for DummyProgressMonitor {
-  fn set_progress(&mut self, _progress : u64) -> () { }
-}
 
 struct ProgressBarProgressMonitor { pb : ProgressBar<std::io::Stderr> }
 
@@ -206,37 +208,24 @@ fn main() {
 
   let mut buf = vec![0u8;blocksize];
 
+  let mut input_source : Box<Source> = if input != "" {
+      Box::new(FileSource::new(&input, blocksize as u64).unwrap())
+  }else{
+      Box::new(StdInSource::new(blocksize as u64))
+  };
+
   let mut output_sink : Box<Sink> = if output != "" {
       Box::new(FileArraySink::new(&output.split(";").collect()).unwrap())
   } else {
-      Box::new(StdOutSink::new())
+      Box::new(StdOutSink::new(input_source))
   };
 
-  let mut input_source : Box<Source> = if input != "" {
-      Box::new(FileSource::new(&input).unwrap())
-  }else{
-      Box::new(StdInSource::new())
-  };
-
-  let mut iteration = 0;
+  /*let mut iteration = 0;
   let mut progress_monitor : Box<ProgressMonitor> = match input_source.size() {
       Err(_) => Box::new(IndeterminateProgressMonitor::new()),
       Ok(size) => Box::new(ProgressBarProgressMonitor::new(size)),
-      };
+      };*/
 
-  let mut len = input_source.read(&mut buf).expect("Failed initial read");
-  while len > 0 {
+  output_sink.start();
 
-    // Do fs sync
-    
-    if iteration % 500 == 0{
-      output_sink.force_sync().expect("Failed to do OS sync of output stream");
-      if !quiet {
-        progress_monitor.set_progress((iteration * blocksize + len) as u64);
-      }
-    }
-    output_sink.write(&buf[..len]).expect("Write failure");
-    len = input_source.read(&mut buf).expect("Read failure");
-    iteration += 1;
-  }
 }
