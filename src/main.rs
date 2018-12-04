@@ -1,6 +1,8 @@
 extern crate argparse;
 extern crate pbr;
+extern crate rayon;
 
+use rayon::prelude::*;
 use argparse::{ArgumentParser, StoreTrue, Store};
 use std::fs::File;
 use std::io::Read;
@@ -16,19 +18,14 @@ use std::thread;
 
 trait Sink{
   fn start(&mut self) -> ();
-  fn wait(&mut self) -> ();
 }
 
 trait Source : Send{
   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
   fn size(&mut self) -> std::io::Result<u64>;
   fn blocksize(&self) -> u64;
-}
 
-// Source that can be split into many parts for parallell consumption
-
-trait SplittableSource : Source{
-  fn split(&mut self) -> Self;
+  fn split(&mut self) -> Option<Box<Source>>;
 }
 
 // Struct to read data from a file
@@ -41,12 +38,6 @@ impl FileSource {
       Ok(x) => Ok(FileSource{file : x, path : string.to_string(), blocksize : blocksize}),
       Err(_) => Err(format!("Failed to open {} for reading", string)),
     }
-  }
-}
-
-impl SplittableSource for FileSource {
-  fn split(&mut self) -> Self{
-    FileSource::new(&self.path, self.blocksize).unwrap()
   }
 }
 
@@ -63,6 +54,10 @@ impl Source for FileSource {
     })
   }
   fn blocksize(&self) -> u64 { self.blocksize }
+
+  fn split(&mut self) -> Option<Box<Source>>{
+    Some(Box::new(FileSource::new(&self.path, self.blocksize).unwrap()))
+  }
 }
 
 // Struct to read data from stdin
@@ -84,16 +79,20 @@ impl Source for StdInSource{
     Err(std::io::Error::new(ErrorKind::Other, "Stream size undefined"))
   }
   fn blocksize(&self) -> u64 { self.blocksize }
+
+  fn split(&mut self) -> Option<Box<Source>>{
+    None
+  }
 }
 
 
 
 // Struct to pipe data to a set of files
 
-struct FileArraySink { files: Vec<File> }
+struct FileArraySink { files: Vec<File>, source : Box<Source> }
 
 impl FileArraySink {
-  fn new(strings : &Vec<&str>) -> Result<FileArraySink, String>{
+  fn new(strings : &Vec<&str>, source : Box<Source>) -> Result<FileArraySink, String>{
       let mut file_vector = vec![];
       for filename in strings{
           let file = File::create(filename);
@@ -102,39 +101,71 @@ impl FileArraySink {
           }
           file_vector.push(file.unwrap());
       }
-      Ok(FileArraySink{files : file_vector})
+      Ok(FileArraySink{files : file_vector, source : source})
   }
 }
 
 impl Sink for FileArraySink {
-  fn start(&mut self) {}
-  fn wait(&mut self) {}
+  fn start(&mut self) {
+    let blocksize = self.source.blocksize() as usize;
+    let mut handle_list = vec![];
+    for mut file in self.files.iter() {
+      match self.source.split() {
+        Some(new_source) => handle_list.push(new_source),
+        None => ()
+      }
+    }
+    if handle_list.len() == self.files.len() {
+      let operation : Vec<()> = handle_list.par_iter_mut().zip(self.files.par_iter_mut()).map(
+        |(source, file)|{
+        let mut buf = vec![0u8;blocksize];
+        let mut len = source.read(&mut buf).expect("Failed initial read");
+        let mut iteration = 0;
+        while len > 0 {
+          file.write_all(&buf[..len]).expect("Write failure");
+          len = source.read(&mut buf).expect("Read failure");
+          iteration += 1;
+          if iteration % 100 == 0{
+            println!("{} B", iteration*blocksize);
+          }
+        }
+      }).collect();
+    }else{
+      let mut buf = vec![0u8;blocksize];
+      let mut len = self.source.read(&mut buf).expect("Failed initial read");
+      let mut iteration = 0;
+      while len > 0 {
+        let operation : Vec<()> = self.files.par_iter_mut().map(
+        |mut file|
+        {file.write_all(&buf[..len]).expect("Write failure");}).collect();
+        len = self.source.read(&mut buf).expect("Read failure");
+        iteration += 1;
+      }
+    }
+  }
 }
 
 // Struct to pipe data out to stdio
 
-struct StdOutSink{stdout : std::io::Stdout, source : Box<Source>, handle : Option<Box<thread::JoinHandle<Box<FnOnce()>>>>} 
+struct StdOutSink{stdout : std::io::Stdout, source : Box<Source>} 
 impl StdOutSink{
   fn new(source : Box<Source>) -> StdOutSink{
-    StdOutSink{stdout : std::io::stdout(), source : source, handle : None}
+    StdOutSink{stdout : std::io::stdout(), source : source}
   }
 }
 
 impl Sink for StdOutSink{
   fn start(&mut self) {
-    let handle = thread::spawn(|| {
-    let mut buf = vec![0u8;self.source.blocksize() as usize];
-    /*let mut len = self.source.read(&mut buf).expect("Failed initial read");
+    let blocksize = self.source.blocksize() as usize;
+    let mut buf = vec![0u8;blocksize];
+    let mut len = self.source.read(&mut buf).expect("Failed initial read");
     let mut iteration = 0;
     while len > 0 {
       self.stdout.write_all(&buf[..len]).expect("Write failure");
       len = self.source.read(&mut buf).expect("Read failure");
       iteration += 1;
-    }*/
-    });
+    }
   }
-
-  fn wait(&mut self) {}
 }
 
 trait ProgressMonitor {
@@ -215,7 +246,7 @@ fn main() {
   };
 
   let mut output_sink : Box<Sink> = if output != "" {
-      Box::new(FileArraySink::new(&output.split(";").collect()).unwrap())
+      Box::new(FileArraySink::new(&output.split(";").collect(), input_source).unwrap())
   } else {
       Box::new(StdOutSink::new(input_source))
   };

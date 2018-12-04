@@ -7,3 +7,4 @@ authors = ["Théo Friberg <theo.friberg@gmail.com>"]
 
 argparse = "0.2.2"
 pbr = "1.0.0"
+rayon = "1.0.3"
